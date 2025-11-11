@@ -13,6 +13,7 @@ import { TopToolbarProvider } from "./views/topToolbarProvider";
 import { SDKManager } from "./managers/sdkManager";
 import { ToolchainManager } from "./managers/toolchainManager";
 import { SysConfigManager } from "./managers/sysconfigManager";
+import { GmakeManager } from "./managers/gmakeManager";
 import { CliManager } from "./managers/cliManager";
 import { ConnectionManager } from "./managers/connectionManager";
 import { BuildCommand } from "./commands/buildCommand";
@@ -32,6 +33,7 @@ let topToolbarProvider: TopToolbarProvider;
 let sdkManager: SDKManager;
 let toolchainManager: ToolchainManager;
 let sysConfigManager: SysConfigManager;
+let gmakeManager: GmakeManager;
 let cliManager: CliManager;
 let connectionManager: ConnectionManager;
 let statusBarItem: vscode.StatusBarItem;
@@ -809,6 +811,9 @@ export async function activate(context: vscode.ExtensionContext) {
     sysConfigManager = new SysConfigManager(context, outputChannel);
     outputChannel.appendLine("  SysConfig Manager initialized");
 
+    gmakeManager = new GmakeManager(context, outputChannel);
+    outputChannel.appendLine("  Gmake Manager initialized");
+
     connectionManager = new ConnectionManager(context, outputChannel);
     outputChannel.appendLine("  Connection Manager initialized");
 
@@ -822,6 +827,20 @@ export async function activate(context: vscode.ExtensionContext) {
     } catch (error) {
       outputChannel.appendLine(`  CLI Manager initialization failed: ${error}`);
       throw error;
+    }
+
+    // Initialize gmake if not already installed
+    outputChannel.appendLine("Checking gmake installation...");
+    try {
+      const gmakeInstalled = await gmakeManager.isGmakeInstalled();
+      if (!gmakeInstalled) {
+        outputChannel.appendLine("  gmake not found, will download on first build");
+      } else {
+        const gmakeInfo = await gmakeManager.getGmakeInfo();
+        outputChannel.appendLine(`  gmake ready: ${gmakeInfo.executablePath} (${gmakeInfo.version})`);
+      }
+    } catch (error) {
+      outputChannel.appendLine(`  gmake check failed: ${error}`);
     }
 
     outputChannel.appendLine("All managers initialized successfully");
@@ -1643,6 +1662,18 @@ async function setupToolchain(): Promise<void> {
           await sysConfigManager.installSysConfig();
         }
 
+        if (abortController.signal.aborted) {
+          throw new Error("Setup was cancelled by user");
+        }
+
+        // Install gmake
+        if (!(await gmakeManager.isGmakeInstalled())) {
+          progress.report({ message: "Installing gmake..." });
+          await gmakeManager.installGmake((gmakeProgress) => {
+            progress.report({ message: `Installing gmake: ${gmakeProgress.message}` });
+          });
+        }
+
         progress.report({ message: "Setup complete!" });
       }
     );
@@ -1693,6 +1724,9 @@ async function refreshStatus(): Promise<void> {
     const sysConfigInstalled = await sysConfigManager.isSysConfigInstalled();
     const sysConfigInfo = await sysConfigManager.getSysConfigInfo();
 
+    const gmakeInstalled = await gmakeManager.isGmakeInstalled();
+    const gmakeInfo = await gmakeManager.getGmakeInfo();
+
     const boards = await connectionManager.detectBoards();
 
     outputChannel.appendLine(`Status refresh complete:`);
@@ -1708,6 +1742,12 @@ async function refreshStatus(): Promise<void> {
     outputChannel.appendLine(
       `  SysConfig: ${sysConfigInstalled
         ? `installed (${sysConfigInfo.version})`
+        : "not installed"
+      }`
+    );
+    outputChannel.appendLine(
+      `  gmake: ${gmakeInstalled
+        ? `installed (${gmakeInfo.version})`
         : "not installed"
       }`
     );
