@@ -204,7 +204,6 @@ ${config.sourceFiles.map((srcFile, idx) => {
         const mkPath = path.join(config.outputPath, 'linker.mk');
 
         const normalizePath = (p: string) => p.replace(/\\/g, '/');
-        const escapePath = (p: string) => p.replace(/ /g, '\\ ');
 
         // Find linker script
         const linkerScript = path.join(config.projectPath, 'syscfg', 'device_linker.cmd');
@@ -230,7 +229,7 @@ ${config.libraryPaths.map(p => `LDFLAGS += -L"${normalizePath(p)}"`).join('\n')}
 ${hasDriverlib ? `LDFLAGS += -L"${normalizePath(driverlibDir)}"` : ''}
 
 # Linker script (paths with spaces are escaped)
-${hasLinkerScript ? `LDFLAGS += -Wl,-l${escapePath(normalizePath(linkerScript))}` : ''}
+${hasLinkerScript ? `LDFLAGS += -Wl,-l"${normalizePath(linkerScript)}"` : ''}
 
 # Libraries
 LIBS := -Wl,-llibc.a
@@ -238,7 +237,7 @@ ${hasDriverlib ? `LIBS += -Wl,--library=driverlib.a` : ''}
 
 # Additional linker files
 ${fs.existsSync(path.join(config.projectPath, 'syscfg', 'device.cmd.genlibs')) ?
-`LDFLAGS += -Wl,-l${escapePath(normalizePath(path.join(config.projectPath, 'syscfg', 'device.cmd.genlibs')))}` : ''}
+`LDFLAGS += -Wl,-l"${normalizePath(path.join(config.projectPath, 'syscfg', 'device.cmd.genlibs'))}"` : ''}
 `;
 
         fs.writeFileSync(mkPath, content, 'utf8');
