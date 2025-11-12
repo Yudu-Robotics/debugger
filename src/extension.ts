@@ -13,11 +13,13 @@ import { TopToolbarProvider } from "./views/topToolbarProvider";
 import { SDKManager } from "./managers/sdkManager";
 import { ToolchainManager } from "./managers/toolchainManager";
 import { SysConfigManager } from "./managers/sysconfigManager";
+import { GmakeManager } from "./managers/gmakeManager";
 import { CliManager } from "./managers/cliManager";
 import { ConnectionManager } from "./managers/connectionManager";
 import { BuildCommand } from "./commands/buildCommand";
 import { FlashCommand } from "./commands/flashCommand";
 import { DebugCommand } from "./commands/debugCommand";
+import { detectEntryPoint } from "./utils/entryPointFinder";
 
 let outputChannel: vscode.OutputChannel;
 let treeViewProvider: Port11TreeViewProvider;
@@ -31,6 +33,7 @@ let topToolbarProvider: TopToolbarProvider;
 let sdkManager: SDKManager;
 let toolchainManager: ToolchainManager;
 let sysConfigManager: SysConfigManager;
+let gmakeManager: GmakeManager;
 let cliManager: CliManager;
 let connectionManager: ConnectionManager;
 let statusBarItem: vscode.StatusBarItem;
@@ -479,7 +482,22 @@ export async function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine("Flash command triggered");
         outputChannel.show();
 
-        const binPath = getAbsolutePath("build/main.hex");
+        // Detect entry point to determine hex file name
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceFolder) {
+          throw new Error("No workspace folder open");
+        }
+
+        const entryPoint = await detectEntryPoint(workspaceFolder, outputChannel);
+        if (!entryPoint) {
+          throw new Error("Could not detect entry point file. Please ensure your project has a main() function.");
+        }
+
+        const hexFileName = `build/${entryPoint.baseName}.hex`;
+        const binPath = getAbsolutePath(hexFileName);
+
+        outputChannel.appendLine(`Using hex file: ${hexFileName}`);
+
         await executeSwdDebuggerCommand(
           ["flash", "--file", binPath],
           "Flash completed successfully!",
@@ -488,6 +506,7 @@ export async function activate(context: vscode.ExtensionContext) {
         );
       } catch (error) {
         outputChannel.appendLine(`ERROR: Flash command failed: ${error}`);
+        vscode.window.showErrorMessage(`Flash failed: ${error}`);
       }
     }
   );
@@ -792,6 +811,9 @@ export async function activate(context: vscode.ExtensionContext) {
     sysConfigManager = new SysConfigManager(context, outputChannel);
     outputChannel.appendLine("  SysConfig Manager initialized");
 
+    gmakeManager = new GmakeManager(context, outputChannel);
+    outputChannel.appendLine("  Gmake Manager initialized");
+
     connectionManager = new ConnectionManager(context, outputChannel);
     outputChannel.appendLine("  Connection Manager initialized");
 
@@ -805,6 +827,20 @@ export async function activate(context: vscode.ExtensionContext) {
     } catch (error) {
       outputChannel.appendLine(`  CLI Manager initialization failed: ${error}`);
       throw error;
+    }
+
+    // Initialize gmake if not already installed
+    outputChannel.appendLine("Checking gmake installation...");
+    try {
+      const gmakeInstalled = await gmakeManager.isGmakeInstalled();
+      if (!gmakeInstalled) {
+        outputChannel.appendLine("  gmake not found, will download on first build");
+      } else {
+        const gmakeInfo = await gmakeManager.getGmakeInfo();
+        outputChannel.appendLine(`  gmake ready: ${gmakeInfo.executablePath} (${gmakeInfo.version})`);
+      }
+    } catch (error) {
+      outputChannel.appendLine(`  gmake check failed: ${error}`);
     }
 
     outputChannel.appendLine("All managers initialized successfully");
@@ -1133,8 +1169,10 @@ export async function activate(context: vscode.ExtensionContext) {
         "port11-debugger.debug.start",
         async (port?: string) => {
           await debugCommand.start(port);
-          treeViewProvider.setDebugActive(true);
 
+          treeViewProvider.setDebugActive(true);
+          breakpointsViewProvider?.setDebugActive(true); 
+          
           // Show the top toolbar when debug starts
           topToolbarProvider?.show();
 
@@ -1267,9 +1305,6 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.window.showErrorMessage(`Failed to resume target: ${error}`);
           }
         }
-      ),
-      vscode.commands.registerCommand("port11-debugger.debug.restart", () =>
-        restartDebugSession(debugCommand)
       ),
 
       // Debug stepping commands
@@ -1627,6 +1662,18 @@ async function setupToolchain(): Promise<void> {
           await sysConfigManager.installSysConfig();
         }
 
+        if (abortController.signal.aborted) {
+          throw new Error("Setup was cancelled by user");
+        }
+
+        // Install gmake
+        if (!(await gmakeManager.isGmakeInstalled())) {
+          progress.report({ message: "Installing gmake..." });
+          await gmakeManager.installGmake((gmakeProgress) => {
+            progress.report({ message: `Installing gmake: ${gmakeProgress.message}` });
+          });
+        }
+
         progress.report({ message: "Setup complete!" });
       }
     );
@@ -1677,6 +1724,9 @@ async function refreshStatus(): Promise<void> {
     const sysConfigInstalled = await sysConfigManager.isSysConfigInstalled();
     const sysConfigInfo = await sysConfigManager.getSysConfigInfo();
 
+    const gmakeInstalled = await gmakeManager.isGmakeInstalled();
+    const gmakeInfo = await gmakeManager.getGmakeInfo();
+
     const boards = await connectionManager.detectBoards();
 
     outputChannel.appendLine(`Status refresh complete:`);
@@ -1692,6 +1742,12 @@ async function refreshStatus(): Promise<void> {
     outputChannel.appendLine(
       `  SysConfig: ${sysConfigInstalled
         ? `installed (${sysConfigInfo.version})`
+        : "not installed"
+      }`
+    );
+    outputChannel.appendLine(
+      `  gmake: ${gmakeInstalled
+        ? `installed (${gmakeInfo.version})`
         : "not installed"
       }`
     );

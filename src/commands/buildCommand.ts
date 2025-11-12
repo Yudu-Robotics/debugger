@@ -6,7 +6,10 @@ import { spawn, ChildProcess } from 'child_process';
 import { SDKManager } from '../managers/sdkManager';
 import { ToolchainManager } from '../managers/toolchainManager';
 import { SysConfigManager } from '../managers/sysconfigManager';
+import { GmakeManager } from '../managers/gmakeManager';
 import { DownloadUtils } from '../utils/downloadUtils';
+import { detectEntryPoint, EntryPointResult } from '../utils/entryPointFinder';
+import { MakefileGenerator } from '../utils/makefileGenerator';
 
 export interface BuildOptions {
     target?: string;
@@ -24,7 +27,7 @@ export interface BuildResult {
 }
 
 export interface BuildProgress {
-    stage: 'setup' | 'sysconfig' | 'compile' | 'link' | 'complete' | 'error';
+    stage: 'setup' | 'sysconfig' | 'makefile' | 'compile' | 'link' | 'complete' | 'error';
     message: string;
     percentage: number;
     elapsedTime: number;
@@ -37,6 +40,7 @@ export class BuildCommand {
     private sdkManager: SDKManager;
     private toolchainManager: ToolchainManager;
     private sysConfigManager: SysConfigManager;
+    private gmakeManager: GmakeManager;
     private buildProcess: ChildProcess | null = null;
     private diagnosticCollection: vscode.DiagnosticCollection;
 
@@ -57,6 +61,7 @@ export class BuildCommand {
         this.sdkManager = sdkManager;
         this.toolchainManager = toolchainManager;
         this.sysConfigManager = sysConfigManager;
+        this.gmakeManager = new GmakeManager(context, outputChannel);
         console.log('BuildCommand using output channel:', this.outputChannel);
         this.diagnosticCollection = vscode.languages.createDiagnosticCollection('port11-debugger');
 
@@ -126,6 +131,7 @@ export class BuildCommand {
         switch (stage) {
             case 'setup': return '[Setup]';
             case 'sysconfig': return '[Config]';
+            case 'makefile': return '[Makefile]';
             case 'compile': return '[Build]';
             case 'link': return '[Link]';
             case 'complete': return 'SUCCESS:';
@@ -224,19 +230,29 @@ export class BuildCommand {
             this.outputChannel.appendLine(`Mode: ${options.optimization === 'release' ? 'Release' : 'Debug'}`);
             this.outputChannel.appendLine('');
 
-            // Stage 2: SysConfig generation (15-35%)
+            // Stage 2: SysConfig generation (15-30%)
             this.updateProgress('sysconfig', 'Generating SysConfig files', 20);
             try {
-                await this.runSysConfigGeneration();
+                await this.runSysConfigGeneration(buildConfig);
+                this.rewriteGenLibsPath(projectInfo.rootPath);
             } catch (error) {
                 this.updateProgress('error', 'SysConfig generation failed', 100);
                 throw error;  // Stop immediately on SysConfig failure
             }
 
-            // Stage 3: Compilation (35-95%)
-            this.updateProgress('compile', 'Starting compilation', 35);
+            // Stage 3: Makefile generation (30-40%)
+            this.updateProgress('makefile', 'Generating Makefile and build scripts', 30);
             try {
-                const result = await this.executeBuild(buildConfig);
+                await this.generateMakefiles(buildConfig, projectInfo);
+            } catch (error) {
+                this.updateProgress('error', 'Makefile generation failed', 100);
+                throw error;  // Stop immediately on Makefile generation failure
+            }
+
+            // Stage 4: Compilation with gmake (40-95%)
+            this.updateProgress('compile', 'Starting gmake compilation', 40);
+            try {
+                const result = await this.executeGmakeBuild(buildConfig);
                 this.updateProgress('complete', 'Build completed successfully', 100);
                 return result;
             } catch (error) {
@@ -388,7 +404,6 @@ export class BuildCommand {
                 return {
                     rootPath: folderPath,
                     projectFiles,
-                    hasMain: projectFiles.some(f => f.endsWith('main.c')),
                     hasMakeFile: projectFiles.some(f => f.toLowerCase().includes('makefile')),
                     hasSysConfig: projectFiles.some(f => f.endsWith('.syscfg')),
                     foundFileTypes
@@ -417,6 +432,17 @@ export class BuildCommand {
 
     private async prepareBuildConfig(projectInfo: any, options: BuildOptions): Promise<any> {
         this.outputChannel.appendLine('Preparing build configuration...');
+
+        // Detect entry point file (with main() function)
+        this.outputChannel.appendLine('Detecting project entry point...');
+        const entryPoint = await detectEntryPoint(projectInfo.rootPath, this.outputChannel);
+
+        if (!entryPoint) {
+            throw new Error('No entry point file found. Build cancelled.');
+        }
+
+        this.outputChannel.appendLine(`Entry point detected: ${entryPoint.fileName}`);
+        this.outputChannel.appendLine('');
 
         // Get compiler path with detailed logging
         const compilerPath = this.toolchainManager.getCompilerPath();
@@ -457,6 +483,8 @@ export class BuildCommand {
             ...this.toolchainManager.getLibraryPaths()
         ];
 
+        this.outputChannel.appendLine(`libraryPaths: ${this.sdkManager.getLibraryPaths()} , ${this.toolchainManager.getLibraryPaths()}`);
+
         // Log successful configuration
         this.outputChannel.appendLine('Build configuration prepared successfully:');
         this.outputChannel.appendLine(`   Project: ${path.basename(projectInfo.rootPath)}`);
@@ -473,6 +501,8 @@ export class BuildCommand {
             includePaths,
             libraryPaths,
             sourceFiles: await this.findSourceFiles(projectInfo.rootPath),
+            entryPointFile: entryPoint.filePath,
+            entryPointBaseName: entryPoint.baseName,
             optimization: options.optimization || 'debug',
             verbose: options.verbose || false,
             outputPath: path.join(projectInfo.rootPath, 'build')
@@ -494,6 +524,220 @@ export class BuildCommand {
         }
 
         return sourceFiles;
+    }
+
+    private async generateMakefiles(config: any, projectInfo: any): Promise<void> {
+        this.outputChannel.appendLine('Generating Makefile and build scripts...');
+        this.outputChannel.appendLine(`Output directory: ${config.outputPath}`);
+
+        try {
+            // Get valid source files (same logic as before)
+            const validSourceFiles = await this.getValidSourceFiles(config);
+            // Prepare Makefile configuration
+            const makefileConfig = {
+                projectPath: config.projectPath,
+                projectName: path.basename(config.projectPath),
+                compilerPath: config.compilerPath,
+                sdkPath: this.sdkManager.getSDKPath(),
+                includePaths: config.includePaths,
+                libraryPaths: config.libraryPaths,
+                sourceFiles: validSourceFiles,
+                entryPointFile: config.entryPointFile,
+                entryPointBaseName: config.entryPointBaseName,
+                outputPath: config.outputPath,
+                optimization: config.optimization,
+                device: '__MSPM0G3507__'
+            };
+            
+            // Generate Makefile and .mk files
+            MakefileGenerator.generateMakefiles(makefileConfig);
+
+            this.outputChannel.appendLine('✓ Makefile generated successfully');
+            this.outputChannel.appendLine('✓ compiler.mk generated successfully');
+            this.outputChannel.appendLine('✓ sources.mk generated successfully');
+            this.outputChannel.appendLine('✓ linker.mk generated successfully');
+            this.outputChannel.appendLine('');
+
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.outputChannel.appendLine(`Makefile generation failed: ${errorMessage}`);
+            throw error;
+        }
+    }
+
+    private async executeGmakeBuild(config: any): Promise<BuildResult> {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Ensure gmake is available
+                const gmakePath = this.gmakeManager.getGmakePath();
+                if (!gmakePath) {
+                    this.outputChannel.appendLine('gmake not found, attempting to install...');
+                    await this.gmakeManager.installGmake((progress) => {
+                        this.outputChannel.appendLine(`gmake setup: ${progress.message}`);
+                    });
+
+                    const newGmakePath = this.gmakeManager.getGmakePath();
+                    if (!newGmakePath) {
+                        throw new Error('Failed to install gmake. Please install GNU Make manually.');
+                    }
+                }
+
+                const gmakeExecutable = this.gmakeManager.getGmakePath();
+                if (!gmakeExecutable) {
+                    throw new Error('gmake executable not found');
+                }
+
+                this.outputChannel.appendLine('='.repeat(80));
+                this.outputChannel.appendLine('**** Clean-only build ****');
+                this.outputChannel.appendLine('='.repeat(80));
+                this.outputChannel.appendLine('');
+                this.outputChannel.appendLine(`Executing: gmake -k -j 9 clean`);
+                this.outputChannel.appendLine('');
+
+                // Step 1: Clean previous build
+                await this.runGmakeCommand(gmakeExecutable, ['-k', 'clean'], config.outputPath);
+
+                this.outputChannel.appendLine('');
+                this.outputChannel.appendLine('**** Build finished ****');
+                this.outputChannel.appendLine('');
+                this.outputChannel.appendLine('='.repeat(80));
+                this.outputChannel.appendLine('**** Build of configuration \'Debug\' ****');
+                this.outputChannel.appendLine('='.repeat(80));
+                this.outputChannel.appendLine('');
+                this.outputChannel.appendLine(`Executing: gmake -k -j 9 all`);
+                this.outputChannel.appendLine('');
+
+                // Step 2: Build with gmake
+                const buildSuccess = await this.runGmakeCommand(
+                    gmakeExecutable,
+                    ['-k', '-j', '9', 'all'],
+                    config.outputPath
+                );
+
+                this.outputChannel.appendLine('');
+                this.outputChannel.appendLine('**** Build finished ****');
+                this.outputChannel.appendLine('');
+
+                const outputFile = path.join(config.outputPath, `${config.entryPointBaseName}.out`);
+                const hexFile = path.join(config.outputPath, `${config.entryPointBaseName}.hex`);
+                const elfFile = path.join(config.outputPath, `${config.entryPointBaseName}.elf`);
+
+                const result: BuildResult = {
+                    success: buildSuccess && fs.existsSync(outputFile),
+                    errors: [],
+                    warnings: [],
+                    buildTime: Date.now() - this.buildStartTime,
+                    outputPath: buildSuccess ? outputFile : undefined
+                };
+
+                if (result.success) {
+                    this.outputChannel.appendLine('BUILD COMPLETED SUCCESSFULLY');
+                    this.outputChannel.appendLine(`Output: ${path.relative(config.projectPath, outputFile)}`);
+
+                    if (fs.existsSync(hexFile)) {
+                        this.outputChannel.appendLine(`   • ${path.relative(config.projectPath, hexFile)}`);
+                    }
+                    if (fs.existsSync(elfFile)) {
+                        this.outputChannel.appendLine(`   • ${path.relative(config.projectPath, elfFile)}`);
+                    }
+
+                    try {
+                        const stats = fs.statSync(outputFile);
+                        this.outputChannel.appendLine(`Binary size: ${stats.size.toLocaleString()} bytes`);
+                    } catch (e) {
+                        // Ignore size check errors
+                    }
+
+                    this.outputChannel.appendLine('');
+                    this.outputChannel.appendLine('NEXT STEPS:');
+                    this.outputChannel.appendLine('   • Use "Flash Firmware" to program your board');
+                    this.outputChannel.appendLine('   • Use "Start Debug" to begin debugging session');
+                } else {
+                    this.outputChannel.appendLine('BUILD FAILED');
+                    this.outputChannel.appendLine('   • Check the output above for error details');
+                    this.outputChannel.appendLine('   • Verify source files and include paths');
+                }
+
+                this.outputChannel.appendLine('='.repeat(80));
+                resolve(result);
+
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                this.outputChannel.appendLine(`Build error: ${errorMessage}`);
+                reject(error);
+            }
+        });
+    }
+
+    private async runGmakeCommand(gmakePath: string, args: string[], cwd: string): Promise<boolean> {
+        return new Promise((resolve, reject) => {
+            // Debug: Log the working directory
+            this.outputChannel.appendLine(`Working directory: ${cwd}`);
+
+            // Verify the working directory exists and has a Makefile
+            if (!fs.existsSync(cwd)) {
+                this.outputChannel.appendLine(`ERROR: Build directory does not exist: ${cwd}`);
+                reject(new Error(`Build directory does not exist: ${cwd}`));
+                return;
+            }
+
+            const makefilePath = path.join(cwd, 'Makefile');
+            if (!fs.existsSync(makefilePath)) {
+                this.outputChannel.appendLine(`ERROR: Makefile not found at: ${makefilePath}`);
+                reject(new Error(`Makefile not found at: ${makefilePath}`));
+                return;
+            }
+
+            this.outputChannel.appendLine('');
+
+            const gmakeProcess = spawn(gmakePath, args, {
+                cwd: cwd,
+                stdio: ['pipe', 'pipe', 'pipe'],
+                shell: os.platform() === 'win32'
+            });
+
+            let hasErrors = false;
+
+            gmakeProcess.stdout?.on('data', (data) => {
+                const output = data.toString();
+                const lines = output.split('\n');
+                lines.forEach((line: string) => {
+                    if (line.trim()) {
+                        this.outputChannel.appendLine(`  ${line.trim()}`);
+                        if (line.toLowerCase().includes('error:')) {
+                            hasErrors = true;
+                        }
+                    }
+                });
+            });
+
+            gmakeProcess.stderr?.on('data', (data) => {
+                const output = data.toString();
+                const lines = output.split('\n');
+                lines.forEach((line: string) => {
+                    if (line.trim()) {
+                        this.outputChannel.appendLine(`  ${line.trim()}`);
+                        if (line.toLowerCase().includes('error:') || line.toLowerCase().includes('no rule')) {
+                            hasErrors = true;
+                        }
+                    }
+                });
+            });
+
+            gmakeProcess.on('close', (code) => {
+                if (code === 0 && !hasErrors) {
+                    resolve(true);
+                } else {
+                    this.outputChannel.appendLine(`gmake exited with code: ${code}`);
+                    resolve(false);
+                }
+            });
+
+            gmakeProcess.on('error', (error) => {
+                this.outputChannel.appendLine(`gmake process error: ${error.message}`);
+                reject(error);
+            });
+        });
     }
 
     private async executeBuild(config: any): Promise<BuildResult> {
@@ -526,8 +770,8 @@ export class BuildCommand {
                     args.push(sourceFile);
                 });
 
-                // Output file
-                const outputFile = path.join(config.outputPath, 'main.out');
+                // Output file (use entry point base name)
+                const outputFile = path.join(config.outputPath, `${config.entryPointBaseName}.out`);
                 args.push('-o');
                 args.push(outputFile);
 
@@ -567,13 +811,14 @@ export class BuildCommand {
                 }
                 // Additional linker flags
                 args.push('-Wl,--diag_wrap=off');          // Disable diagnostic wrapping
-                args.push('-Wl,--display_error_number');    // Show error numbers  
+                args.push('-Wl,--display_error_number');    // Show error numbers
                 args.push('-Wl,--warn_sections');           // Warn about section issues
-                args.push('-Wl,--xml_link_info=main_linkInfo.xml');
+                args.push(`-Wl,--xml_link_info=${config.entryPointBaseName}_linkInfo.xml`);
                 args.push('-Wl,--rom_model');              // Use ROM model
 
                 // Add additional TI-specific linker libraries if available
                 const deviceGenLibs = path.join(config.projectPath, 'syscfg', 'device.cmd.genlibs');
+                this.outputChannel.appendLine(`Checking for additional TI-specific linker libraries... - ${deviceGenLibs}`);
                 if (fs.existsSync(deviceGenLibs)) {
                     args.push(`-Wl,-l${deviceGenLibs}`);
                 }
@@ -587,7 +832,7 @@ export class BuildCommand {
                 }
 
                 // Add map file generation for debugging
-                const mapFile = path.join(config.outputPath, 'main.map');
+                const mapFile = path.join(config.outputPath, `${config.entryPointBaseName}.map`);
                 args.push(`-Wl,-m${path.basename(mapFile)}`);
 
                 // const driverlibPath = path.join(this.sdkManager.getSDKPath(), 'source', 'ti', 'driverlib', 'lib', 'ticlang', 'm0p', 'mspm0g1x0x_g3x0x');
@@ -692,9 +937,9 @@ export class BuildCommand {
                                 const tiarmobjcopyPath = path.join(binDir, `tiarmobjcopy${exe}`);
 
                                 const outDir = config.outputPath;           // build directory
-                                const outOut = outputFile;                  // build/main.out
-                                const hexOut = path.join(outDir, 'main.hex');
-                                const elfOut = path.join(outDir, 'main.elf');
+                                const outOut = outputFile;                  // build/<entrypoint>.out
+                                const hexOut = path.join(outDir, `${config.entryPointBaseName}.hex`);
+                                const elfOut = path.join(outDir, `${config.entryPointBaseName}.elf`);
 
                                 // STEP_6: Generate Intel HEX from main.out
                                 // Mirrors your Compiler_Commands.txt STEP_6 flags
@@ -804,13 +1049,14 @@ export class BuildCommand {
     private async getValidSourceFiles(config: any): Promise<string[]> {
         const validFiles: string[] = [];
 
-        // 1. Main source file
-        const mainFile = path.join(config.projectPath, 'main.c');
-        if (fs.existsSync(mainFile)) {
-            validFiles.push(mainFile);
-            this.outputChannel.appendLine(`Found main source: main.c`);
+        // 1. Entry point source file (dynamically detected)
+        const entryPointFile = config.entryPointFile;
+        if (entryPointFile && fs.existsSync(entryPointFile)) {
+            validFiles.push(entryPointFile);
+            this.outputChannel.appendLine(`Found entry point: ${path.basename(entryPointFile)}`);
         } else {
-            this.outputChannel.appendLine(`Missing main source: main.c`);
+            this.outputChannel.appendLine(`ERROR: Entry point file not found: ${entryPointFile || 'undefined'}`);
+            throw new Error('Entry point file not found. Please ensure your project has a file with main() function.');
         }
 
         // 2. SysConfig generated file - ONLY from syscfg directory
@@ -890,17 +1136,17 @@ export class BuildCommand {
         this.outputChannel.appendLine(`Total valid source files: ${validFiles.length}`);
 
         // Verify we have essential files
-        const hasMain = validFiles.some(f => path.basename(f) === 'main.c');
+        const hasEntryPoint = validFiles.some(f => f === config.entryPointFile);
         const hasSysConfig = validFiles.some(f => f.includes('syscfg') && f.endsWith('ti_msp_dl_config.c'));
         const hasStartup = validFiles.some(f => f.includes('startup_mspm0g350x_ticlang.c'));
 
         this.outputChannel.appendLine(`Essential files check:`);
-        this.outputChannel.appendLine(`   • main.c: ${hasMain ? 'SUCCESS:' : 'ERROR:'}`);
+        this.outputChannel.appendLine(`   • Entry point (${path.basename(config.entryPointFile)}): ${hasEntryPoint ? 'SUCCESS:' : 'ERROR:'}`);
         this.outputChannel.appendLine(`   • SysConfig: ${hasSysConfig ? 'SUCCESS:' : 'ERROR:'}`);
         this.outputChannel.appendLine(`   • Startup: ${hasStartup ? 'SUCCESS:' : 'ERROR:'}`);
 
-        if (!hasMain) {
-            throw new Error('main.c is required but not found');
+        if (!hasEntryPoint) {
+            throw new Error(`Entry point file ${path.basename(config.entryPointFile)} is required but not found`);
         }
         if (!hasSysConfig) {
             this.outputChannel.appendLine(`Warning: No SysConfig file found - build may fail`);
@@ -912,7 +1158,23 @@ export class BuildCommand {
         return validFiles;
     }
 
-    private async runSysConfigGeneration(): Promise<void> {
+    private rewriteGenLibsPath(projectPath: string): void {
+        const genLibsPath = path.join(projectPath, 'syscfg', 'device.cmd.genlibs');
+        if(!fs.existsSync(genLibsPath)) {
+            return;
+        }
+
+        const driverlibPath = path.join(this.sdkManager.getSDKPath(), 'source', 'ti', 'driverlib', 'lib', 'ticlang', 'm0p', 'mspm0g1x0x_g3x0x');
+        const original = fs.readFileSync(genLibsPath, 'utf8');
+
+        const rewritten = original.replace(/-l"ti\/driverlib\/lib\/ticlang\/m0p\/mspm0g1x0x_g3x0x\/driverlib\.a"/g, `-l"${path.join(driverlibPath,'driverlib.a')}"`);
+
+        if (original !== rewritten) {
+            fs.writeFileSync(genLibsPath, rewritten, 'utf8');
+        }
+    }
+
+    private async runSysConfigGeneration(config:any): Promise<void> {
         // Find .syscfg files in the project
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
@@ -966,6 +1228,7 @@ export class BuildCommand {
             this.outputChannel.appendLine(`   Arguments: ${args.join(' ')}`);
 
             await this.runSysConfigCLI(sysConfigCliPath, args, projectDir);
+            
         }
     }
 
@@ -1204,7 +1467,7 @@ exit /b %ERRORLEVEL%`;
             proc.stdout?.on('data', (data) => {
                 const s = data.toString();
                 s.split('\n').forEach((line: string) => {
-                    if (line.trim()) this.outputChannel.appendLine(`  ${line.trim()}`);
+                    if (line.trim()) {this.outputChannel.appendLine(`  ${line.trim()}`);}
                 });
             });
 
@@ -1212,7 +1475,7 @@ exit /b %ERRORLEVEL%`;
                 const s = data.toString();
                 stderr += s;
                 s.split('\n').forEach((line: string) => {
-                    if (line.trim()) this.outputChannel.appendLine(`  ${line.trim()}`);
+                    if (line.trim()) {this.outputChannel.appendLine(`  ${line.trim()}`);}
                 });
             });
 
@@ -1222,7 +1485,7 @@ exit /b %ERRORLEVEL%`;
                     resolve();
                 } else {
                     this.outputChannel.appendLine(`${label} failed with exit code ${code}`);
-                    if (stderr.trim()) this.outputChannel.appendLine(stderr.trim());
+                    if (stderr.trim()) {this.outputChannel.appendLine(stderr.trim());}
                     reject(new Error(`${label} failed`));
                 }
             });
@@ -1265,7 +1528,7 @@ exit /b %ERRORLEVEL%`;
                 const s = data.toString();
                 stderr += s;
                 s.split('\n').forEach((line: string) => {
-                    if (line.trim()) this.outputChannel.appendLine(`  ${line.trim()}`);
+                    if (line.trim()) {this.outputChannel.appendLine(`  ${line.trim()}`);}
                 });
             });
 
@@ -1283,7 +1546,7 @@ exit /b %ERRORLEVEL%`;
                     }
                 } else {
                     this.outputChannel.appendLine(`${label} failed with exit code ${code}`);
-                    if (stderr.trim()) this.outputChannel.appendLine(stderr.trim());
+                    if (stderr.trim()) {this.outputChannel.appendLine(stderr.trim());}
                     reject(new Error(`${label} failed`));
                 }
             });
