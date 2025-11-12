@@ -123,10 +123,26 @@ export class GmakeManager {
           `Found gmake in install path: ${installPath}`
         );
         return installPath;
+      } else {
+        this.outputChannel.appendLine(
+          `gmake not found in install path: ${installPath}. Initiating installation...`
+        );
+        this.installGmake((gmakeProgress) => {
+          this.outputChannel.appendLine(
+            `[gmake Install] ${
+              gmakeProgress.message
+            } (${gmakeProgress.progress.toFixed(1)}%)`
+          );
+        })
+          .then(() => {
+            this.outputChannel.appendLine(`gmake installed at: ${installPath}`);
+            return installPath;
+          })
+          .catch((error) => {
+            this.outputChannel.appendLine(`Failed to install gmake: ${error}`);
+            return undefined;
+          });
       }
-
-      this.outputChannel.appendLine("No gmake found in any location");
-      return undefined;
     } catch (error) {
       this.outputChannel.appendLine(`Error getting gmake path: ${error}`);
       return undefined;
